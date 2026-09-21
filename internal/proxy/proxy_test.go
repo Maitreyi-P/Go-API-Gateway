@@ -281,3 +281,154 @@ func TestRouter_RateLimit_429(t *testing.T) {
 		t.Errorf("backend was called %d times, want 2 (the rejected request must not reach the backend)", got)
 	}
 }
+
+// TestRouter_CircuitBreaker_TripsAndReturns503 confirms the breaker is
+// wired in front of the actual backend call: once a backend's failure
+// rate crosses its configured threshold, the gateway must stop calling it
+// (proved via a call counter on the fake backend) and instead respond 503
+// immediately.
+func TestRouter_CircuitBreaker_TripsAndReturns503(t *testing.T) {
+	// The backend succeeds for its first two calls, then fails from the
+	// third call onward, so the failure rate crosses the 50% threshold
+	// exactly on the fourth call (2 failures / 4 total).
+	var backendCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&backendCalls, 1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(backend.Close)
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				PathPrefix: "/api",
+				Backends:   []string{backend.URL},
+				CircuitBreaker: &config.CircuitBreaker{
+					FailureThreshold: 0.5,
+					WindowSeconds:    60,
+					CooldownSeconds:  60,
+				},
+			},
+		},
+	}
+
+	gateway := httptest.NewServer(newRouter(t, cfg))
+	t.Cleanup(gateway.Close)
+
+	wantStatuses := []int{
+		http.StatusOK,
+		http.StatusOK,
+		http.StatusInternalServerError,
+		http.StatusInternalServerError, // failure rate hits 2/4 = 50% here; breaker trips right after this response is sent
+	}
+	for i, want := range wantStatuses {
+		resp, err := http.Get(gateway.URL + "/api/ping")
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("request %d: status = %d, want %d", i, resp.StatusCode, want)
+		}
+	}
+
+	if got := atomic.LoadInt32(&backendCalls); got != 4 {
+		t.Fatalf("backend called %d times before trip, want 4", got)
+	}
+
+	// The breaker should now be Open. The next request must be rejected
+	// immediately with 503 and a JSON error body.
+	resp, err := http.Get(gateway.URL + "/api/ping")
+	if err != nil {
+		t.Fatalf("request after trip: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+	body := decodeJSON(t, resp)
+	if _, ok := body["error"]; !ok {
+		t.Errorf("expected JSON error body, got %v", body)
+	}
+
+	// Further attempts must all be rejected the same way, without ever
+	// reaching the backend again.
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(gateway.URL + "/api/ping")
+		if err != nil {
+			t.Fatalf("request after trip (extra %d): %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("request after trip (extra %d): status = %d, want %d", i, resp.StatusCode, http.StatusServiceUnavailable)
+		}
+	}
+
+	if got := atomic.LoadInt32(&backendCalls); got != 4 {
+		t.Errorf("backend was called %d times after the breaker tripped, want still 4 (no further calls)", got)
+	}
+}
+
+// TestRouter_CircuitBreaker_SkipsOpenBackendInRoundRobin confirms that when
+// a route has multiple backends, round-robin selection skips a backend
+// whose breaker has tripped and keeps routing traffic to the healthy one,
+// rather than ever returning 503 while a healthy backend remains.
+func TestRouter_CircuitBreaker_SkipsOpenBackendInRoundRobin(t *testing.T) {
+	var failingCalls, healthyCalls int32
+
+	failingBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&failingCalls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failingBackend.Close)
+
+	healthyBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&healthyCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"backend": "healthy"})
+	}))
+	t.Cleanup(healthyBackend.Close)
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				PathPrefix: "/api",
+				Backends:   []string{failingBackend.URL, healthyBackend.URL},
+				CircuitBreaker: &config.CircuitBreaker{
+					FailureThreshold: 0.5,
+					WindowSeconds:    60,
+					CooldownSeconds:  60,
+				},
+			},
+		},
+	}
+
+	gateway := httptest.NewServer(newRouter(t, cfg))
+	t.Cleanup(gateway.Close)
+
+	// Round-robin alternates failing/healthy at first. The failing
+	// backend's breaker trips on its very first call (1 failure / 1 total
+	// = 100%), so every request after that should land on the healthy
+	// backend instead of ever returning 503.
+	const requests = 10
+	for i := 0; i < requests; i++ {
+		resp, err := http.Get(gateway.URL + "/api/ping")
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			t.Fatalf("request %d: got 503 even though the healthy backend was available", i)
+		}
+	}
+
+	if got := atomic.LoadInt32(&failingCalls); got != 1 {
+		t.Errorf("failing backend was called %d times, want exactly 1 (it should stop being called once its breaker trips)", got)
+	}
+	if got := atomic.LoadInt32(&healthyCalls); got != requests-1 {
+		t.Errorf("healthy backend was called %d times, want %d", got, requests-1)
+	}
+}

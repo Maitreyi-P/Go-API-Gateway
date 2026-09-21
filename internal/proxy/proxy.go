@@ -1,7 +1,8 @@
 // Package proxy implements the gateway's routing and reverse-proxy core:
 // matching requests to a configured route by longest path prefix,
-// enforcing that route's rate limit (if any), then forwarding to one of
-// its backends (round-robin if there is more than one).
+// enforcing that route's rate limit (if any), then forwarding to a
+// backend chosen by round-robin among those whose circuit breaker
+// currently allows calls.
 package proxy
 
 import (
@@ -16,7 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/Maitreyi-P/Go-API-Gateway/internal/breaker"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/ratelimit"
 )
@@ -27,12 +30,19 @@ type Router struct {
 	routes []*compiledRoute
 }
 
+// backendTarget is one backend of a route: its URL, a ready-to-use reverse
+// proxy, and its own circuit breaker.
+type backendTarget struct {
+	url     *url.URL
+	proxy   *httputil.ReverseProxy
+	breaker *breaker.Breaker // nil means circuit breaking is disabled for this backend
+}
+
 // compiledRoute is a route with its backends pre-parsed into ready-to-use
-// reverse proxies, plus round-robin and rate-limit state.
+// targets, plus round-robin and rate-limit state.
 type compiledRoute struct {
 	prefix   string
-	backends []*url.URL
-	proxies  []*httputil.ReverseProxy
+	backends []*backendTarget
 	next     atomic.Uint32
 
 	// limiter is nil when the route has no rate_limit configured, meaning
@@ -57,22 +67,34 @@ func NewRouter(cfg *config.Config, logger *slog.Logger) (*Router, error) {
 
 	routes := make([]*compiledRoute, 0, len(cfg.Routes))
 	for _, r := range cfg.Routes {
-		backends := make([]*url.URL, 0, len(r.Backends))
+		var breakerCfg *breaker.Config
+		if cb := r.CircuitBreaker; cb != nil {
+			breakerCfg = &breaker.Config{
+				FailureThreshold: cb.FailureThreshold,
+				Window:           time.Duration(cb.WindowSeconds) * time.Second,
+				Cooldown:         time.Duration(cb.CooldownSeconds) * time.Second,
+			}
+		}
+
+		backends := make([]*backendTarget, 0, len(r.Backends))
 		for _, b := range r.Backends {
 			u, err := url.Parse(b)
 			if err != nil {
 				return nil, fmt.Errorf("route %s: parsing backend %q: %w", r.PathPrefix, b, err)
 			}
-			backends = append(backends, u)
+			bt := &backendTarget{
+				url:   u,
+				proxy: newReverseProxy(u, logger),
+			}
+			if breakerCfg != nil {
+				bt.breaker = breaker.New(*breakerCfg)
+			}
+			backends = append(backends, bt)
 		}
 
 		cr := &compiledRoute{
 			prefix:   r.PathPrefix,
 			backends: backends,
-			proxies:  make([]*httputil.ReverseProxy, len(backends)),
-		}
-		for i, target := range backends {
-			cr.proxies[i] = newReverseProxy(target, logger)
 		}
 		if rl := r.RateLimit; rl != nil {
 			cr.limiter = ratelimit.NewLimiter(rl.RequestsPerSecond, rl.Burst)
@@ -93,8 +115,8 @@ func (rt *Router) Routes() []RouteInfo {
 	out := make([]RouteInfo, 0, len(rt.routes))
 	for _, r := range rt.routes {
 		backends := make([]string, len(r.backends))
-		for i, b := range r.backends {
-			backends[i] = b.String()
+		for i, bt := range r.backends {
+			backends[i] = bt.url.String()
 		}
 		out = append(out, RouteInfo{PathPrefix: r.prefix, Backends: backends})
 	}
@@ -103,12 +125,14 @@ func (rt *Router) Routes() []RouteInfo {
 
 // ServeHTTP matches the request to a route by longest path_prefix,
 // enforces that route's rate limit (if configured), and forwards allowed
-// requests to the next backend in the route's round-robin rotation.
+// requests to the next available backend in the route's round-robin
+// rotation, skipping any backend whose circuit breaker is currently Open.
 //
 // If no route matches, it responds 404 with a JSON error body. If the
 // client has exceeded the route's rate limit, it responds 429 with a
 // Retry-After header and a JSON error body, without contacting any
-// backend.
+// backend. If every backend's breaker is Open, it responds 503 with a
+// JSON error body, again without contacting any backend.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := rt.match(r.URL.Path)
 	if route == nil {
@@ -120,7 +144,9 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route.nextProxy().ServeHTTP(w, r)
+	if !route.forward(w, r) {
+		writeJSONError(w, http.StatusServiceUnavailable, "circuit open: all backends for this route are currently unavailable")
+	}
 }
 
 func (rt *Router) match(path string) *compiledRoute {
@@ -153,13 +179,67 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request) bo
 	return false
 }
 
-// nextProxy returns the next backend's reverse proxy in round-robin order.
-func (cr *compiledRoute) nextProxy() *httputil.ReverseProxy {
-	if len(cr.proxies) == 1 {
-		return cr.proxies[0]
+// forward picks the next backend in round-robin order, skipping any whose
+// circuit breaker is Open, and proxies the request to it. It reports the
+// outcome (backend unreachable, or a 5xx response, counts as failure) back
+// to that backend's breaker before returning.
+//
+// It returns false, having written nothing, if every backend is currently
+// unavailable (Open); the caller is responsible for responding in that
+// case.
+func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request) bool {
+	n := len(cr.backends)
+	start := int(cr.next.Add(1) % uint32(n))
+
+	for i := 0; i < n; i++ {
+		bt := cr.backends[(start+i)%n]
+
+		if bt.breaker != nil && !bt.breaker.Allow() {
+			continue
+		}
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		bt.proxy.ServeHTTP(rec, r)
+
+		if bt.breaker != nil {
+			bt.breaker.Report(rec.status < http.StatusInternalServerError)
+		}
+		return true
 	}
-	idx := cr.next.Add(1) % uint32(len(cr.proxies))
-	return cr.proxies[idx]
+
+	return false
+}
+
+// statusRecorder wraps an http.ResponseWriter to capture the status code
+// ultimately written, so the caller can classify the response as a
+// success or failure for the circuit breaker after ServeHTTP returns.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (rec *statusRecorder) WriteHeader(status int) {
+	if !rec.wroteHeader {
+		rec.status = status
+		rec.wroteHeader = true
+	}
+	rec.ResponseWriter.WriteHeader(status)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if !rec.wroteHeader {
+		rec.WriteHeader(http.StatusOK)
+	}
+	return rec.ResponseWriter.Write(b)
+}
+
+// Flush lets httputil.ReverseProxy stream responses (e.g. chunked bodies)
+// through the recorder as it would through the underlying writer directly.
+func (rec *statusRecorder) Flush() {
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // newReverseProxy builds a ReverseProxy for a single backend target, with a

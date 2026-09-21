@@ -17,19 +17,27 @@ type RateLimit struct {
 	Burst             int     `yaml:"burst"`
 }
 
+// CircuitBreaker configures per-backend circuit breaking: a backend trips
+// from Closed to Open once its failure rate within a rolling window of
+// WindowSeconds crosses FailureThreshold, then stays Open for
+// CooldownSeconds before a single trial call is allowed through.
+type CircuitBreaker struct {
+	FailureThreshold float64 `yaml:"failure_threshold"`
+	WindowSeconds    int     `yaml:"window_seconds"`
+	CooldownSeconds  int     `yaml:"cooldown_seconds"`
+}
+
 // Route defines a single routing rule: requests whose path starts with
 // PathPrefix are forwarded to one of Backends (round-robin if more than
-// one is configured). RateLimit is optional; a route without one is
-// unlimited.
-//
-// The YAML schema also supports a circuit_breaker key per route (see PRD
-// section 6); that is intentionally not modeled here yet and is ignored
-// during parsing rather than rejected, since it'll be added in a later
-// phase.
+// one is configured). RateLimit and CircuitBreaker are both optional; a
+// route without one is unlimited / never trips, respectively. CircuitBreaker
+// applies independently to each backend in Backends, not to the route as a
+// whole.
 type Route struct {
-	PathPrefix string     `yaml:"path_prefix"`
-	Backends   []string   `yaml:"backends"`
-	RateLimit  *RateLimit `yaml:"rate_limit,omitempty"`
+	PathPrefix     string          `yaml:"path_prefix"`
+	Backends       []string        `yaml:"backends"`
+	RateLimit      *RateLimit      `yaml:"rate_limit,omitempty"`
+	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker,omitempty"`
 }
 
 // Config is the top-level gateway configuration.
@@ -92,6 +100,18 @@ func (c *Config) Validate() error {
 			}
 			if rl.Burst < 1 {
 				return fmt.Errorf("route %d (%s): rate_limit.burst must be >= 1", i, r.PathPrefix)
+			}
+		}
+
+		if cb := r.CircuitBreaker; cb != nil {
+			if cb.FailureThreshold <= 0 || cb.FailureThreshold > 1 {
+				return fmt.Errorf("route %d (%s): circuit_breaker.failure_threshold must be in (0, 1]", i, r.PathPrefix)
+			}
+			if cb.WindowSeconds < 1 {
+				return fmt.Errorf("route %d (%s): circuit_breaker.window_seconds must be >= 1", i, r.PathPrefix)
+			}
+			if cb.CooldownSeconds < 1 {
+				return fmt.Errorf("route %d (%s): circuit_breaker.cooldown_seconds must be >= 1", i, r.PathPrefix)
 			}
 		}
 	}
