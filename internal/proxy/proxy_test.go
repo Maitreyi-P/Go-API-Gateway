@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
@@ -205,5 +206,78 @@ func TestRouter_BadGateway(t *testing.T) {
 	body := decodeJSON(t, resp)
 	if _, ok := body["error"]; !ok {
 		t.Errorf("expected JSON error body, got %v", body)
+	}
+}
+
+// TestRouter_RateLimit_429 confirms the rate-limit middleware is wired in
+// front of the reverse proxy: once a client exceeds its route's configured
+// burst, the gateway must reject the request with 429 and a Retry-After
+// header, and must never forward that rejected request to the backend.
+func TestRouter_RateLimit_429(t *testing.T) {
+	var backendCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&backendCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"backend": "limited"})
+	}))
+	t.Cleanup(backend.Close)
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				PathPrefix: "/api",
+				Backends:   []string{backend.URL},
+				RateLimit:  &config.RateLimit{RequestsPerSecond: 1, Burst: 2},
+			},
+		},
+	}
+
+	gateway := httptest.NewServer(newRouter(t, cfg))
+	t.Cleanup(gateway.Close)
+
+	client := &http.Client{}
+	do := func() *http.Response {
+		req, err := http.NewRequest(http.MethodGet, gateway.URL+"/api/ping", nil)
+		if err != nil {
+			t.Fatalf("building request: %v", err)
+		}
+		// Pin the rate-limit key explicitly rather than relying on the
+		// loopback source port httptest happens to pick.
+		req.Header.Set("X-Forwarded-For", "192.0.2.1")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		return resp
+	}
+
+	// The configured burst of 2 should both succeed.
+	for i := 0; i < 2; i++ {
+		resp := do()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i, resp.StatusCode, http.StatusOK)
+		}
+		resp.Body.Close()
+	}
+
+	// A third request immediately after must be rejected without touching
+	// the backend.
+	resp := do()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("expected a Retry-After header on the 429 response")
+	}
+
+	body := decodeJSON(t, resp)
+	if _, ok := body["error"]; !ok {
+		t.Errorf("expected JSON error body, got %v", body)
+	}
+
+	if got := atomic.LoadInt32(&backendCalls); got != 2 {
+		t.Errorf("backend was called %d times, want 2 (the rejected request must not reach the backend)", got)
 	}
 }
