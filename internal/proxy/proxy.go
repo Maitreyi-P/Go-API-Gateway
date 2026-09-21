@@ -1,21 +1,24 @@
 // Package proxy implements the gateway's routing and reverse-proxy core:
-// matching requests to a configured route by longest path prefix, then
-// forwarding to one of that route's backends (round-robin if there is more
-// than one).
+// matching requests to a configured route by longest path prefix,
+// enforcing that route's rate limit (if any), then forwarding to one of
+// its backends (round-robin if there is more than one).
 package proxy
 
 import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
+	"github.com/Maitreyi-P/Go-API-Gateway/internal/ratelimit"
 )
 
 // Router matches incoming requests to a route and proxies them to a
@@ -25,12 +28,16 @@ type Router struct {
 }
 
 // compiledRoute is a route with its backends pre-parsed into ready-to-use
-// reverse proxies, plus round-robin state.
+// reverse proxies, plus round-robin and rate-limit state.
 type compiledRoute struct {
 	prefix   string
 	backends []*url.URL
 	proxies  []*httputil.ReverseProxy
 	next     atomic.Uint32
+
+	// limiter is nil when the route has no rate_limit configured, meaning
+	// requests to it are unlimited.
+	limiter *ratelimit.Limiter
 }
 
 // RouteInfo is a read-only summary of a compiled route, used for startup
@@ -67,6 +74,9 @@ func NewRouter(cfg *config.Config, logger *slog.Logger) (*Router, error) {
 		for i, target := range backends {
 			cr.proxies[i] = newReverseProxy(target, logger)
 		}
+		if rl := r.RateLimit; rl != nil {
+			cr.limiter = ratelimit.NewLimiter(rl.RequestsPerSecond, rl.Burst)
+		}
 		routes = append(routes, cr)
 	}
 
@@ -91,15 +101,25 @@ func (rt *Router) Routes() []RouteInfo {
 	return out
 }
 
-// ServeHTTP matches the request to a route by longest path_prefix and
-// forwards it to the next backend in that route's round-robin rotation. If
-// no route matches, it responds 404 with a JSON error body.
+// ServeHTTP matches the request to a route by longest path_prefix,
+// enforces that route's rate limit (if configured), and forwards allowed
+// requests to the next backend in the route's round-robin rotation.
+//
+// If no route matches, it responds 404 with a JSON error body. If the
+// client has exceeded the route's rate limit, it responds 429 with a
+// Retry-After header and a JSON error body, without contacting any
+// backend.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := rt.match(r.URL.Path)
 	if route == nil {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no route matches path %q", r.URL.Path))
 		return
 	}
+
+	if !route.allowRequest(w, r) {
+		return
+	}
+
 	route.nextProxy().ServeHTTP(w, r)
 }
 
@@ -110,6 +130,27 @@ func (rt *Router) match(path string) *compiledRoute {
 		}
 	}
 	return nil
+}
+
+// allowRequest enforces the route's rate limit, if any. When the request
+// is not allowed, it writes the 429 response itself (including a
+// Retry-After header estimating when a token will next be available) and
+// returns false; the caller must not forward the request in that case.
+func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request) bool {
+	if cr.limiter == nil {
+		return true
+	}
+
+	key := ratelimit.ClientIP(r)
+	allowed, retryAfter := cr.limiter.Allow(key)
+	if allowed {
+		return true
+	}
+
+	retryAfterSeconds := int(math.Ceil(retryAfter.Seconds()))
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
+	return false
 }
 
 // nextProxy returns the next backend's reverse proxy in round-robin order.
@@ -133,7 +174,7 @@ func newReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Error("backend unreachable",
+		logger.Error("502 backend unreachable",
 			"backend", target.String(),
 			"path", r.URL.Path,
 			"error", err,

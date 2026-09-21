@@ -10,17 +10,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// RateLimit configures per-route token-bucket rate limiting: up to Burst
+// requests may arrive at once, refilling at RequestsPerSecond thereafter.
+type RateLimit struct {
+	RequestsPerSecond float64 `yaml:"requests_per_second"`
+	Burst             int     `yaml:"burst"`
+}
+
 // Route defines a single routing rule: requests whose path starts with
 // PathPrefix are forwarded to one of Backends (round-robin if more than
-// one is configured).
+// one is configured). RateLimit is optional; a route without one is
+// unlimited.
 //
-// The YAML schema also supports rate_limit and circuit_breaker keys per
-// route (see PRD section 6); those are intentionally not modeled here yet
-// and are ignored during parsing rather than rejected, since they'll be
-// added in a later phase.
+// The YAML schema also supports a circuit_breaker key per route (see PRD
+// section 6); that is intentionally not modeled here yet and is ignored
+// during parsing rather than rejected, since it'll be added in a later
+// phase.
 type Route struct {
-	PathPrefix string   `yaml:"path_prefix"`
-	Backends   []string `yaml:"backends"`
+	PathPrefix string     `yaml:"path_prefix"`
+	Backends   []string   `yaml:"backends"`
+	RateLimit  *RateLimit `yaml:"rate_limit,omitempty"`
 }
 
 // Config is the top-level gateway configuration.
@@ -74,6 +83,15 @@ func (c *Config) Validate() error {
 			u, err := url.Parse(b)
 			if err != nil || u.Scheme == "" || u.Host == "" {
 				return fmt.Errorf("route %d (%s): backend %d %q is not a valid absolute URL", i, r.PathPrefix, j, b)
+			}
+		}
+
+		if rl := r.RateLimit; rl != nil {
+			if rl.RequestsPerSecond <= 0 {
+				return fmt.Errorf("route %d (%s): rate_limit.requests_per_second must be > 0", i, r.PathPrefix)
+			}
+			if rl.Burst < 1 {
+				return fmt.Errorf("route %d (%s): rate_limit.burst must be >= 1", i, r.PathPrefix)
 			}
 		}
 	}
