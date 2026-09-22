@@ -19,15 +19,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/breaker"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
+	"github.com/Maitreyi-P/Go-API-Gateway/internal/metrics"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/ratelimit"
 )
 
 // Router matches incoming requests to a route and proxies them to a
 // backend. It implements http.Handler.
 type Router struct {
-	routes []*compiledRoute
+	routes  []*compiledRoute
+	metrics *metrics.Metrics
 }
 
 // backendTarget is one backend of a route: its URL, a ready-to-use reverse
@@ -60,9 +64,16 @@ type RouteInfo struct {
 // NewRouter builds a Router from a validated config. It pre-parses every
 // backend URL and constructs one reverse proxy per backend up front, so
 // request handling does no allocation beyond round-robin selection.
-func NewRouter(cfg *config.Config, logger *slog.Logger) (*Router, error) {
+//
+// m may be nil, in which case the Router creates its own Metrics backed by
+// a private registry (useful for callers, such as most tests, that don't
+// care about inspecting metrics).
+func NewRouter(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (*Router, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if m == nil {
+		m = metrics.New(prometheus.NewRegistry())
 	}
 
 	routes := make([]*compiledRoute, 0, len(cfg.Routes))
@@ -88,6 +99,7 @@ func NewRouter(cfg *config.Config, logger *slog.Logger) (*Router, error) {
 			}
 			if breakerCfg != nil {
 				bt.breaker = breaker.New(*breakerCfg)
+				m.SetBreakerState(bt.url.String(), bt.breaker.State())
 			}
 			backends = append(backends, bt)
 		}
@@ -107,7 +119,7 @@ func NewRouter(cfg *config.Config, logger *slog.Logger) (*Router, error) {
 		return len(routes[i].prefix) > len(routes[j].prefix)
 	})
 
-	return &Router{routes: routes}, nil
+	return &Router{routes: routes, metrics: m}, nil
 }
 
 // Routes returns a summary of the compiled routes for startup logging.
@@ -133,20 +145,31 @@ func (rt *Router) Routes() []RouteInfo {
 // Retry-After header and a JSON error body, without contacting any
 // backend. If every backend's breaker is Open, it responds 503 with a
 // JSON error body, again without contacting any backend.
+//
+// Every request that completes, regardless of outcome, is recorded in
+// gateway_requests_total and gateway_request_duration_seconds.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	route := rt.match(r.URL.Path)
 	if route == nil {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no route matches path %q", r.URL.Path))
+		rt.metrics.ObserveRequest(metrics.UnmatchedRoute, metrics.NoBackend, http.StatusNotFound, time.Since(start))
 		return
 	}
 
-	if !route.allowRequest(w, r) {
+	if !route.allowRequest(w, r, rt.metrics) {
+		rt.metrics.ObserveRequest(route.prefix, metrics.NoBackend, http.StatusTooManyRequests, time.Since(start))
 		return
 	}
 
-	if !route.forward(w, r) {
+	backendURL, status, ok := route.forward(w, r, rt.metrics)
+	if !ok {
 		writeJSONError(w, http.StatusServiceUnavailable, "circuit open: all backends for this route are currently unavailable")
+		status = http.StatusServiceUnavailable
+		backendURL = metrics.NoBackend
 	}
+	rt.metrics.ObserveRequest(route.prefix, backendURL, status, time.Since(start))
 }
 
 func (rt *Router) match(path string) *compiledRoute {
@@ -159,10 +182,12 @@ func (rt *Router) match(path string) *compiledRoute {
 }
 
 // allowRequest enforces the route's rate limit, if any. When the request
-// is not allowed, it writes the 429 response itself (including a
-// Retry-After header estimating when a token will next be available) and
-// returns false; the caller must not forward the request in that case.
-func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request) bool {
+// is not allowed, it records the rejection in
+// gateway_rate_limit_rejections_total, writes the 429 response itself
+// (including a Retry-After header estimating when a token will next be
+// available), and returns false; the caller must not forward the request
+// in that case.
+func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m *metrics.Metrics) bool {
 	if cr.limiter == nil {
 		return true
 	}
@@ -173,6 +198,8 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request) bo
 		return true
 	}
 
+	m.RecordRateLimitRejection(cr.prefix)
+
 	retryAfterSeconds := int(math.Ceil(retryAfter.Seconds()))
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
@@ -182,20 +209,25 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request) bo
 // forward picks the next backend in round-robin order, skipping any whose
 // circuit breaker is Open, and proxies the request to it. It reports the
 // outcome (backend unreachable, or a 5xx response, counts as failure) back
-// to that backend's breaker before returning.
+// to that backend's breaker, and records that backend's resulting state in
+// gateway_circuit_breaker_state, before returning.
 //
-// It returns false, having written nothing, if every backend is currently
-// unavailable (Open); the caller is responsible for responding in that
-// case.
-func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request) bool {
+// It returns ok=false, having written nothing, if every backend is
+// currently unavailable (Open); the caller is responsible for responding
+// in that case.
+func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metrics.Metrics) (backendURL string, status int, ok bool) {
 	n := len(cr.backends)
 	start := int(cr.next.Add(1) % uint32(n))
 
 	for i := 0; i < n; i++ {
 		bt := cr.backends[(start+i)%n]
 
-		if bt.breaker != nil && !bt.breaker.Allow() {
-			continue
+		if bt.breaker != nil {
+			allowed := bt.breaker.Allow()
+			m.SetBreakerState(bt.url.String(), bt.breaker.State())
+			if !allowed {
+				continue
+			}
 		}
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -203,11 +235,12 @@ func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request) bool {
 
 		if bt.breaker != nil {
 			bt.breaker.Report(rec.status < http.StatusInternalServerError)
+			m.SetBreakerState(bt.url.String(), bt.breaker.State())
 		}
-		return true
+		return bt.url.String(), rec.status, true
 	}
 
-	return false
+	return "", 0, false
 }
 
 // statusRecorder wraps an http.ResponseWriter to capture the status code

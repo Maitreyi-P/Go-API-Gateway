@@ -8,7 +8,11 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
+	"github.com/Maitreyi-P/Go-API-Gateway/internal/metrics"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/proxy"
 )
 
@@ -25,7 +29,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	router, err := proxy.NewRouter(cfg, logger)
+	registry := prometheus.NewRegistry()
+	m := metrics.New(registry)
+
+	router, err := proxy.NewRouter(cfg, logger, m)
 	if err != nil {
 		logger.Error("failed to build router from config", "error", err)
 		os.Exit(1)
@@ -35,10 +42,14 @@ func main() {
 		logger.Info("route loaded", "path_prefix", r.PathPrefix, "backends", r.Backends)
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/", router)
+
 	addr := fmt.Sprintf(":%d", *port)
 	logger.Info("gateway starting", "addr", addr, "config", *configPath, "route_count", len(router.Routes()))
 
-	if err := http.ListenAndServe(addr, router); err != nil {
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Error("gateway server failed", "error", err)
 		os.Exit(1)
 	}

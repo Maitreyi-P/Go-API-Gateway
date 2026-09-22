@@ -9,7 +9,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/config"
+	"github.com/Maitreyi-P/Go-API-Gateway/internal/metrics"
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/proxy"
 )
 
@@ -33,13 +37,28 @@ func newBackend(t *testing.T, name string) *httptest.Server {
 	return srv
 }
 
+// newRouter builds a Router with a default, private metrics registry, for
+// tests that don't care about inspecting metrics themselves.
 func newRouter(t *testing.T, cfg *config.Config) *proxy.Router {
 	t.Helper()
-	router, err := proxy.NewRouter(cfg, testLogger())
+	router, err := proxy.NewRouter(cfg, testLogger(), nil)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
 	return router
+}
+
+// newRouterWithMetrics is like newRouter but returns the Metrics instance
+// too, backed by its own isolated registry, so a test can inspect the
+// collectors after driving traffic through the router.
+func newRouterWithMetrics(t *testing.T, cfg *config.Config) (*proxy.Router, *metrics.Metrics) {
+	t.Helper()
+	m := metrics.New(prometheus.NewRegistry())
+	router, err := proxy.NewRouter(cfg, testLogger(), m)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	return router, m
 }
 
 func decodeJSON(t *testing.T, resp *http.Response) map[string]string {
@@ -430,5 +449,133 @@ func TestRouter_CircuitBreaker_SkipsOpenBackendInRoundRobin(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&healthyCalls); got != requests-1 {
 		t.Errorf("healthy backend was called %d times, want %d", got, requests-1)
+	}
+}
+
+// TestRouter_Metrics_RequestsTotal confirms a single request through the
+// full proxy+ratelimit+breaker chain increments gateway_requests_total for
+// the exact route/backend/status labels it produced.
+func TestRouter_Metrics_RequestsTotal(t *testing.T) {
+	backend := newBackend(t, "users")
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{PathPrefix: "/api/users", Backends: []string{backend.URL}},
+		},
+	}
+
+	router, m := newRouterWithMetrics(t, cfg)
+	gateway := httptest.NewServer(router)
+	t.Cleanup(gateway.Close)
+
+	resp, err := http.Get(gateway.URL + "/api/users/1")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	got := testutil.ToFloat64(m.RequestsTotal.WithLabelValues("/api/users", backend.URL, "200"))
+	if got != 1 {
+		t.Errorf("gateway_requests_total{route=/api/users,backend=%s,status=200} = %v, want 1", backend.URL, got)
+	}
+}
+
+// TestRouter_Metrics_RateLimitRejections confirms a request rejected by
+// the rate limiter increments gateway_rate_limit_rejections_total for its
+// route.
+func TestRouter_Metrics_RateLimitRejections(t *testing.T) {
+	backend := newBackend(t, "limited")
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				PathPrefix: "/api",
+				Backends:   []string{backend.URL},
+				RateLimit:  &config.RateLimit{RequestsPerSecond: 1, Burst: 1},
+			},
+		},
+	}
+
+	router, m := newRouterWithMetrics(t, cfg)
+	gateway := httptest.NewServer(router)
+	t.Cleanup(gateway.Close)
+
+	// First request consumes the only token in the burst.
+	resp1, err := http.Get(gateway.URL + "/api/ping")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp1.Body.Close()
+
+	// The second, immediately after, must be rejected.
+	resp2, err := http.Get(gateway.URL + "/api/ping")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp2.StatusCode, http.StatusTooManyRequests)
+	}
+
+	got := testutil.ToFloat64(m.RateLimitRejections.WithLabelValues("/api"))
+	if got != 1 {
+		t.Errorf("gateway_rate_limit_rejections_total{route=/api} = %v, want 1", got)
+	}
+}
+
+// TestRouter_Metrics_CircuitBreakerState confirms gateway_circuit_breaker_state
+// starts at 0 (closed) and updates to 1 (open) once a backend's breaker
+// trips.
+func TestRouter_Metrics_CircuitBreakerState(t *testing.T) {
+	// The backend succeeds for its first two calls, then fails, so the
+	// breaker trips on the fourth call (2 failures / 4 total = 50%).
+	var calls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(backend.Close)
+
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				PathPrefix: "/api",
+				Backends:   []string{backend.URL},
+				CircuitBreaker: &config.CircuitBreaker{
+					FailureThreshold: 0.5,
+					WindowSeconds:    60,
+					CooldownSeconds:  60,
+				},
+			},
+		},
+	}
+
+	router, m := newRouterWithMetrics(t, cfg)
+	gateway := httptest.NewServer(router)
+	t.Cleanup(gateway.Close)
+
+	// The gauge is seeded at startup, before any traffic.
+	if got := testutil.ToFloat64(m.CircuitBreakerState.WithLabelValues(backend.URL)); got != 0 {
+		t.Fatalf("initial gateway_circuit_breaker_state{backend=%s} = %v, want 0 (closed)", backend.URL, got)
+	}
+
+	for i := 0; i < 4; i++ {
+		resp, err := http.Get(gateway.URL + "/api/ping")
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	got := testutil.ToFloat64(m.CircuitBreakerState.WithLabelValues(backend.URL))
+	if got != 1 {
+		t.Errorf("gateway_circuit_breaker_state{backend=%s} = %v, want 1 (open)", backend.URL, got)
 	}
 }
