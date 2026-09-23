@@ -1,0 +1,17 @@
+# Prometheus scrape config for the gateway demo stack.
+#
+# 5s is a short interval, deliberately - fine for a small demo stack with
+# one scrape target, and it makes the Grafana dashboard react quickly
+# enough to be watchable live during scripts/chaos_demo.sh. A production
+# deployment with many targets would typically use 15-30s.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      # "gateway" is the Compose service name, resolved over the internal
+      # gateway-net network - not localhost, which inside this container
+      # would refer to Prometheus itself.
+      - targets: ["gateway:8080"]
