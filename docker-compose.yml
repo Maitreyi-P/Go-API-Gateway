@@ -1,0 +1,47 @@
+services:
+  # backend-a and backend-b build from the identical Dockerfile and build
+  # context, so Docker's layer cache means the second build is effectively
+  # free - they're the same image content, just instantiated twice with
+  # different env vars. (They intentionally don't share one explicit
+  # `image:` tag: Compose can't have two services race to export the same
+  # tag concurrently under `docker compose up --build`.)
+  backend-a:
+    build:
+      context: .
+      dockerfile: cmd/mockbackend/Dockerfile
+    environment:
+      PORT: "9001"
+      BACKEND_NAME: backend-a
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  backend-b:
+    build:
+      context: .
+      dockerfile: cmd/mockbackend/Dockerfile
+    environment:
+      PORT: "9002"
+      BACKEND_NAME: backend-b
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: cmd/gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.docker.yaml:/app/config.yaml:ro
+    depends_on:
+      - backend-a
+      - backend-b
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+networks:
+  gateway-net:
+    driver: bridge

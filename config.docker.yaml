@@ -1,0 +1,27 @@
+# Same shape as config.yaml, but backend hostnames use Docker Compose
+# service names instead of localhost, since the gateway reaches its
+# backends over the compose network, not the host loopback interface.
+# Mounted into the gateway container by docker-compose.yml.
+routes:
+  - path_prefix: /api/users
+    backends:
+      - http://backend-a:9001
+      - http://backend-b:9002
+    rate_limit:
+      requests_per_second: 5
+      burst: 10
+    circuit_breaker:
+      failure_threshold: 0.5
+      window_seconds: 10
+      cooldown_seconds: 15
+
+  - path_prefix: /api/orders
+    backends:
+      - http://backend-a:9001
+    rate_limit:
+      requests_per_second: 5
+      burst: 10
+    circuit_breaker:
+      failure_threshold: 0.5
+      window_seconds: 10
+      cooldown_seconds: 15
