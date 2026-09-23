@@ -8,16 +8,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
+
+// shutdownTimeout is how long the mock backend waits for in-flight
+// requests to finish, once a shutdown signal is received, before
+// forcibly closing remaining connections.
+const shutdownTimeout = 10 * time.Second
 
 // chaosSettings is both the live, mutable chaos configuration and the
 // shape of the JSON body accepted by POST /chaos and returned by GET
@@ -62,15 +71,20 @@ func main() {
 	name := flag.String("name", envOr("BACKEND_NAME", "mockbackend"), "name this backend reports in its responses")
 	failureRate := flag.Float64("failure-rate", 0, "probability (0.0-1.0) that a request to / returns 500 instead of 200")
 	latencyMs := flag.Int("latency-ms", 0, "artificial delay, in milliseconds, added before every response")
+	logFormat := flag.String("log-format", envOr("LOG_FORMAT", "json"), `log output format: "json" or "text"`)
 	flag.Parse()
 
-	initial := chaosSettings{FailureRate: *failureRate, LatencyMs: *latencyMs}
-	if err := initial.validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid startup chaos settings: %v\n", err)
+	logger, err := newLogger(*logFormat)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	initial := chaosSettings{FailureRate: *failureRate, LatencyMs: *latencyMs}
+	if err := initial.validate(); err != nil {
+		logger.Error("invalid startup chaos settings", "error", err)
+		os.Exit(1)
+	}
 
 	chaos := &chaosState{settings: initial}
 
@@ -123,11 +137,53 @@ func main() {
 	})
 
 	addr := ":" + *port
-	logger.Info("mock backend starting", "name", *name, "addr", addr,
-		"failure_rate", initial.FailureRate, "latency_ms", initial.LatencyMs)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		logger.Error("mock backend failed", "error", err)
-		os.Exit(1)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		logger.Info("mock backend starting", "name", *name, "addr", addr,
+			"failure_rate", initial.FailureRate, "latency_ms", initial.LatencyMs)
+		serverErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("mock backend failed", "error", err)
+			os.Exit(1)
+		}
+
+	case <-ctx.Done():
+		stop()
+		logger.Info("shutdown signal received, draining in-flight requests", "timeout", shutdownTimeout.String())
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("graceful shutdown timed out, forcing remaining connections closed", "error", err)
+		} else {
+			logger.Info("mock backend shut down cleanly")
+		}
+	}
+}
+
+// newLogger builds a slog.Logger writing to stdout in the requested
+// format ("json" or "text").
+func newLogger(format string) (*slog.Logger, error) {
+	switch format {
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stdout, nil)), nil
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stdout, nil)), nil
+	default:
+		return nil, fmt.Errorf(`invalid -log-format %q: must be "json" or "text"`, format)
 	}
 }
 

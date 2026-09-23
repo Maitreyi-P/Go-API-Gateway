@@ -32,6 +32,7 @@ import (
 type Router struct {
 	routes  []*compiledRoute
 	metrics *metrics.Metrics
+	logger  *slog.Logger
 }
 
 // backendTarget is one backend of a route: its URL, a ready-to-use reverse
@@ -119,7 +120,7 @@ func NewRouter(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (*Ro
 		return len(routes[i].prefix) > len(routes[j].prefix)
 	})
 
-	return &Router{routes: routes, metrics: m}, nil
+	return &Router{routes: routes, metrics: m, logger: logger}, nil
 }
 
 // Routes returns a summary of the compiled routes for startup logging.
@@ -147,29 +148,46 @@ func (rt *Router) Routes() []RouteInfo {
 // JSON error body, again without contacting any backend.
 //
 // Every request that completes, regardless of outcome, is recorded in
-// gateway_requests_total and gateway_request_duration_seconds.
+// gateway_requests_total and gateway_request_duration_seconds, and logged
+// at Info level with its method, path, matched route, backend, status,
+// and latency.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	route := rt.match(r.URL.Path)
 	if route == nil {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no route matches path %q", r.URL.Path))
-		rt.metrics.ObserveRequest(metrics.UnmatchedRoute, metrics.NoBackend, http.StatusNotFound, time.Since(start))
+		rt.finish(r, metrics.UnmatchedRoute, metrics.NoBackend, http.StatusNotFound, start)
 		return
 	}
 
-	if !route.allowRequest(w, r, rt.metrics) {
-		rt.metrics.ObserveRequest(route.prefix, metrics.NoBackend, http.StatusTooManyRequests, time.Since(start))
+	if !route.allowRequest(w, r, rt.metrics, rt.logger) {
+		rt.finish(r, route.prefix, metrics.NoBackend, http.StatusTooManyRequests, start)
 		return
 	}
 
-	backendURL, status, ok := route.forward(w, r, rt.metrics)
+	backendURL, status, ok := route.forward(w, r, rt.metrics, rt.logger)
 	if !ok {
 		writeJSONError(w, http.StatusServiceUnavailable, "circuit open: all backends for this route are currently unavailable")
 		status = http.StatusServiceUnavailable
 		backendURL = metrics.NoBackend
 	}
-	rt.metrics.ObserveRequest(route.prefix, backendURL, status, time.Since(start))
+	rt.finish(r, route.prefix, backendURL, status, start)
+}
+
+// finish records a completed request's metrics and Info-level log line
+// together, so every exit path in ServeHTTP reports both consistently.
+func (rt *Router) finish(r *http.Request, route, backendURL string, status int, start time.Time) {
+	duration := time.Since(start)
+	rt.metrics.ObserveRequest(route, backendURL, status, duration)
+	rt.logger.Info("request completed",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"route", route,
+		"backend", backendURL,
+		"status", status,
+		"latency_ms", duration.Milliseconds(),
+	)
 }
 
 func (rt *Router) match(path string) *compiledRoute {
@@ -183,11 +201,11 @@ func (rt *Router) match(path string) *compiledRoute {
 
 // allowRequest enforces the route's rate limit, if any. When the request
 // is not allowed, it records the rejection in
-// gateway_rate_limit_rejections_total, writes the 429 response itself
-// (including a Retry-After header estimating when a token will next be
-// available), and returns false; the caller must not forward the request
-// in that case.
-func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m *metrics.Metrics) bool {
+// gateway_rate_limit_rejections_total, logs it at Warn level with the
+// client's identifier, writes the 429 response itself (including a
+// Retry-After header estimating when a token will next be available), and
+// returns false; the caller must not forward the request in that case.
+func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m *metrics.Metrics, logger *slog.Logger) bool {
 	if cr.limiter == nil {
 		return true
 	}
@@ -199,6 +217,12 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m 
 	}
 
 	m.RecordRateLimitRejection(cr.prefix)
+	logger.Warn("rate limit exceeded",
+		"route", cr.prefix,
+		"client", key,
+		"path", r.URL.Path,
+		"retry_after_ms", retryAfter.Milliseconds(),
+	)
 
 	retryAfterSeconds := int(math.Ceil(retryAfter.Seconds()))
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
@@ -209,13 +233,14 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m 
 // forward picks the next backend in round-robin order, skipping any whose
 // circuit breaker is Open, and proxies the request to it. It reports the
 // outcome (backend unreachable, or a 5xx response, counts as failure) back
-// to that backend's breaker, and records that backend's resulting state in
-// gateway_circuit_breaker_state, before returning.
+// to that backend's breaker, records that backend's resulting state in
+// gateway_circuit_breaker_state, and logs at Warn level whenever the
+// breaker's state actually changes, before returning.
 //
 // It returns ok=false, having written nothing, if every backend is
 // currently unavailable (Open); the caller is responsible for responding
 // in that case.
-func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metrics.Metrics) (backendURL string, status int, ok bool) {
+func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metrics.Metrics, logger *slog.Logger) (backendURL string, status int, ok bool) {
 	n := len(cr.backends)
 	start := int(cr.next.Add(1) % uint32(n))
 
@@ -223,8 +248,9 @@ func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metr
 		bt := cr.backends[(start+i)%n]
 
 		if bt.breaker != nil {
+			before := bt.breaker.State()
 			allowed := bt.breaker.Allow()
-			m.SetBreakerState(bt.url.String(), bt.breaker.State())
+			recordBreakerState(m, logger, bt, before)
 			if !allowed {
 				continue
 			}
@@ -234,13 +260,29 @@ func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metr
 		bt.proxy.ServeHTTP(rec, r)
 
 		if bt.breaker != nil {
+			before := bt.breaker.State()
 			bt.breaker.Report(rec.status < http.StatusInternalServerError)
-			m.SetBreakerState(bt.url.String(), bt.breaker.State())
+			recordBreakerState(m, logger, bt, before)
 		}
 		return bt.url.String(), rec.status, true
 	}
 
 	return "", 0, false
+}
+
+// recordBreakerState updates the gateway_circuit_breaker_state gauge for
+// bt to its current state, and logs a Warn-level line if that state
+// differs from before (i.e. this call is what caused a transition).
+func recordBreakerState(m *metrics.Metrics, logger *slog.Logger, bt *backendTarget, before breaker.State) {
+	after := bt.breaker.State()
+	m.SetBreakerState(bt.url.String(), after)
+	if after != before {
+		logger.Warn("circuit breaker state changed",
+			"backend", bt.url.String(),
+			"from", before.String(),
+			"to", after.String(),
+		)
+	}
 }
 
 // statusRecorder wraps an http.ResponseWriter to capture the status code
@@ -287,8 +329,13 @@ func newReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Error("502 backend unreachable",
+		// Warn, not Error: an unreachable backend is an expected failure
+		// mode the gateway is designed to handle (it reports 502 to the
+		// client and the failure counts toward that backend's circuit
+		// breaker) rather than a bug in the gateway itself.
+		logger.Warn("backend unreachable",
 			"backend", target.String(),
+			"method", r.Method,
 			"path", r.URL.Path,
 			"error", err,
 		)
