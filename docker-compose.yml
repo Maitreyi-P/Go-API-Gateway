@@ -12,6 +12,15 @@ services:
     environment:
       PORT: "9001"
       BACKEND_NAME: backend-a
+    # A real gateway deployment wouldn't publish backend ports to the host
+    # at all - clients should only ever reach backends through the
+    # gateway. These are published anyway, deliberately, so
+    # scripts/load_test.sh and scripts/chaos_demo.sh can hit
+    # localhost:9001/9002 directly, exactly as they do in the local
+    # (non-Docker) setup, with no changes needed to run them against this
+    # containerized stack.
+    ports:
+      - "9001:9001"
     networks:
       - gateway-net
     restart: unless-stopped
@@ -23,6 +32,8 @@ services:
     environment:
       PORT: "9002"
       BACKEND_NAME: backend-b
+    ports:
+      - "9002:9002"
     networks:
       - gateway-net
     restart: unless-stopped
@@ -38,6 +49,37 @@ services:
     depends_on:
       - backend-a
       - backend-b
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      # Real defaults (admin/admin), just pre-set so Grafana skips the
+      # forced "set a new password" prompt on first login - one less
+      # manual step before the dashboard is usable.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
     networks:
       - gateway-net
     restart: unless-stopped

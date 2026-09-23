@@ -11,12 +11,26 @@ set -uo pipefail
 
 # --- Configuration (override via environment variables) -----------------
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8080}"
-# The one backend this demo targets directly with chaos. Using the single
-# backend behind /api/orders (rather than one of the two behind
+# The one backend this demo targets directly with chaos: backend-a, which
+# is the single backend behind /api/orders in config.docker.yaml (the
+# Docker Compose stack this script is designed to run against - see
+# docker-compose.yml, which publishes backend-a on host port 9001). Using
+# the single backend behind /api/orders (rather than one of the two behind
 # /api/users) keeps the demo unambiguous: there's no round-robin partner
 # masking whether a given request actually reached it.
-BACKEND_CHAOS_URL="${BACKEND_CHAOS_URL:-http://localhost:9003/chaos}"
-BACKEND_LABEL="${BACKEND_LABEL:-http://localhost:9003}"
+#
+# BACKEND_CHAOS_URL is reached from the host running this script, so it
+# uses localhost + the published port. BACKEND_LABEL must instead match
+# the backend URL string the gateway itself uses internally (the Compose
+# service name, not localhost), since that's what appears in the
+# gateway_circuit_breaker_state metric label.
+#
+# Running this against a local (non-Docker) `go run` setup instead? Since
+# config.yaml uses a 3rd, distinct backend on port 9003 for /api/orders,
+# override both: BACKEND_CHAOS_URL=http://localhost:9003/chaos
+# BACKEND_LABEL=http://localhost:9003
+BACKEND_CHAOS_URL="${BACKEND_CHAOS_URL:-http://localhost:9001/chaos}"
+BACKEND_LABEL="${BACKEND_LABEL:-http://backend-a:9001}"
 LOAD_TARGET="${LOAD_TARGET:-$GATEWAY_URL/api/orders/1}"
 CONCURRENCY="${CONCURRENCY:-5}"
 CHAOS_FAILURE_RATE="${CHAOS_FAILURE_RATE:-1.0}"
@@ -66,11 +80,12 @@ require_reachable() {
 		{
 			echo "error: cannot reach $what at $url"
 			echo
-			echo "Start the gateway and mock backends first, e.g. from the repo root:"
-			echo "  go run ./cmd/mockbackend -port 9001 -name backend-1"
-			echo "  go run ./cmd/mockbackend -port 9002 -name backend-2"
-			echo "  go run ./cmd/mockbackend -port 9003 -name backend-3"
-			echo "  go run ./cmd/gateway -config config.yaml -port 8080"
+			echo "Start the Docker Compose stack first, from the repo root:"
+			echo "  docker compose up -d --build"
+			echo
+			echo "(Running against a local, non-Docker \`go run\` setup instead?"
+			echo "Override BACKEND_CHAOS_URL and BACKEND_LABEL - see the comments"
+			echo "at the top of this script.)"
 			echo
 			echo "Then re-run this script."
 		} >&2
