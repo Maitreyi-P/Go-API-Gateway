@@ -1,27 +1,121 @@
 // Command mockbackend is a small standalone HTTP server used for testing
 // the gateway. It answers every request with a JSON body identifying
 // itself, so it's easy to confirm which backend served a given request.
+//
+// It also simulates an unreliable backend for chaos/load testing: it can
+// inject artificial latency and randomly fail a configurable fraction of
+// requests with a 500, either from startup flags or live via POST /chaos.
 package main
 
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 )
+
+// chaosSettings is both the live, mutable chaos configuration and the
+// shape of the JSON body accepted by POST /chaos and returned by GET
+// /chaos. A POST fully replaces the current settings (it is not a partial
+// merge), matching the example body in its own documentation.
+type chaosSettings struct {
+	FailureRate float64 `json:"failure_rate"`
+	LatencyMs   int     `json:"latency_ms"`
+}
+
+func (s chaosSettings) validate() error {
+	if s.FailureRate < 0 || s.FailureRate > 1 {
+		return fmt.Errorf("failure_rate must be between 0.0 and 1.0, got %v", s.FailureRate)
+	}
+	if s.LatencyMs < 0 {
+		return fmt.Errorf("latency_ms must be >= 0, got %v", s.LatencyMs)
+	}
+	return nil
+}
+
+// chaosState holds the current chaosSettings behind a mutex, since it's
+// read on every request and written concurrently by POST /chaos.
+type chaosState struct {
+	mu       sync.RWMutex
+	settings chaosSettings
+}
+
+func (c *chaosState) get() chaosSettings {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.settings
+}
+
+func (c *chaosState) set(s chaosSettings) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.settings = s
+}
 
 func main() {
 	port := flag.String("port", envOr("PORT", "9001"), "port to listen on")
 	name := flag.String("name", envOr("BACKEND_NAME", "mockbackend"), "name this backend reports in its responses")
+	failureRate := flag.Float64("failure-rate", 0, "probability (0.0-1.0) that a request to / returns 500 instead of 200")
+	latencyMs := flag.Int("latency-ms", 0, "artificial delay, in milliseconds, added before every response")
 	flag.Parse()
+
+	initial := chaosSettings{FailureRate: *failureRate, LatencyMs: *latencyMs}
+	if err := initial.validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid startup chaos settings: %v\n", err)
+		os.Exit(1)
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	chaos := &chaosState{settings: initial}
+
 	mux := http.NewServeMux()
+
+	// /chaos: GET returns the current settings; POST replaces them.
+	mux.HandleFunc("/chaos", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, chaos.get())
+
+		case http.MethodPost:
+			var s chaosSettings
+			if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+				return
+			}
+			if err := s.validate(); err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			chaos.set(s)
+			logger.Info("chaos settings updated", "failure_rate", s.FailureRate, "latency_ms", s.LatencyMs)
+			writeJSON(w, http.StatusOK, s)
+
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	})
+
+	// Every other path: apply current chaos settings, then answer.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
+		s := chaos.get()
+
+		if s.LatencyMs > 0 {
+			time.Sleep(time.Duration(s.LatencyMs) * time.Millisecond)
+		}
+
+		if s.FailureRate > 0 && rand.Float64() < s.FailureRate {
+			writeJSONError(w, http.StatusInternalServerError, "simulated failure")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]string{
 			"backend": *name,
 			"path":    r.URL.Path,
 			"method":  r.Method,
@@ -29,7 +123,8 @@ func main() {
 	})
 
 	addr := ":" + *port
-	logger.Info("mock backend starting", "name", *name, "addr", addr)
+	logger.Info("mock backend starting", "name", *name, "addr", addr,
+		"failure_rate", initial.FailureRate, "latency_ms", initial.LatencyMs)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Error("mock backend failed", "error", err)
 		os.Exit(1)
@@ -41,4 +136,14 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }
