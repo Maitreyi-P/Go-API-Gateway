@@ -13,27 +13,27 @@ Grafana dashboard
 ```
                                    Docker network (gateway-net)
                         ┌──────────────────────────────────────────────┐
-                        │                                                │
-   Clients ────────────▶│   Gateway  :8080                              │
-  (curl, load_test.sh)  │   ┌──────────────────────────────────────┐    │
-                        │   │ Request                               │    │
-                        │   │   → Rate Limiter (token bucket)       │    │
-                        │   │   → Circuit Breaker (per backend)     │    │
-                        │   │   → Reverse Proxy                     │    │
-                        │   └───────────┬──────────────┬────────────┘    │
-                        │               │              │                 │
-                        │               ▼              ▼                 │
-                        │      backend-a :9001   backend-b :9002         │
-                        │      (mock backend,     (mock backend,         │
-                        │       chaos-capable)      chaos-capable)       │
-                        │               │                                │
-                        │               │ /metrics                      │
-                        │               ▼                                │
-                        │        Prometheus :9090  ──scrapes gateway──┐  │
-                        │               │            every 5s        │  │
-                        │               ▼                             │  │
-                        │        Grafana :3000  (auto-provisioned:     │  │
-                        │        Prometheus datasource + dashboard)    │  │
+                        │                                              │
+   Clients ────────────▶│   Gateway  :8080                             │
+  (curl, load_test.sh)  │   ┌──────────────────────────────────────┐   │
+                        │   │ Request                              │   │
+                        │   │   → Rate Limiter (token bucket)      │   │
+                        │   │   → Circuit Breaker (per backend)    │   │
+                        │   │   → Reverse Proxy                    │   │
+                        │   └───────────┬──────────────┬───────────┘   │
+                        │               │              │               │
+                        │               ▼              ▼               │
+                        │      backend-a :9001   backend-b :9002       │
+                        │      (mock backend,     (mock backend,       │
+                        │       chaos-capable)      chaos-capable)     │
+                        │               │                              │
+                        │               │ /metrics                     │
+                        │               ▼                              │
+                        │        Prometheus :9090  ──scrapes gateway──┐│
+                        │               │            every 5s          │
+                        │               ▼                              │
+                        │        Grafana :3000  (auto-provisioned:     │  
+                        │        Prometheus datasource + dashboard)    │  
                         └──────────────────────────────────────────────┘
 ```
 
