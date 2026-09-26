@@ -21,9 +21,6 @@ import (
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/proxy"
 )
 
-// shutdownTimeout is how long the gateway waits for in-flight requests to
-// finish, once a shutdown signal is received, before forcibly closing
-// remaining connections.
 const shutdownTimeout = 10 * time.Second
 
 func main() {
@@ -84,8 +81,6 @@ func main() {
 		}
 
 	case <-ctx.Done():
-		// Restore default signal behavior so a second Ctrl+C forces an
-		// immediate exit if graceful shutdown hangs.
 		stop()
 		logger.Info("shutdown signal received, draining in-flight requests", "timeout", shutdownTimeout.String())
 
@@ -100,8 +95,7 @@ func main() {
 	}
 }
 
-// newLogger builds a slog.Logger writing to stdout in the requested
-// format ("json" or "text").
+
 func newLogger(format string) (*slog.Logger, error) {
 	switch format {
 	case "json":

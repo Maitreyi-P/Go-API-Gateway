@@ -1,10 +1,4 @@
-// Command mockbackend is a small standalone HTTP server used for testing
-// the gateway. It answers every request with a JSON body identifying
-// itself, so it's easy to confirm which backend served a given request.
-//
-// It also simulates an unreliable backend for chaos/load testing: it can
-// inject artificial latency and randomly fail a configurable fraction of
-// requests with a 500, either from startup flags or live via POST /chaos.
+
 package main
 
 import (
@@ -23,15 +17,10 @@ import (
 	"time"
 )
 
-// shutdownTimeout is how long the mock backend waits for in-flight
-// requests to finish, once a shutdown signal is received, before
-// forcibly closing remaining connections.
+
 const shutdownTimeout = 10 * time.Second
 
-// chaosSettings is both the live, mutable chaos configuration and the
-// shape of the JSON body accepted by POST /chaos and returned by GET
-// /chaos. A POST fully replaces the current settings (it is not a partial
-// merge), matching the example body in its own documentation.
+
 type chaosSettings struct {
 	FailureRate float64 `json:"failure_rate"`
 	LatencyMs   int     `json:"latency_ms"`
@@ -47,8 +36,6 @@ func (s chaosSettings) validate() error {
 	return nil
 }
 
-// chaosState holds the current chaosSettings behind a mutex, since it's
-// read on every request and written concurrently by POST /chaos.
 type chaosState struct {
 	mu       sync.RWMutex
 	settings chaosSettings
@@ -90,7 +77,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// /chaos: GET returns the current settings; POST replaces them.
+	
 	mux.HandleFunc("/chaos", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -116,7 +103,7 @@ func main() {
 		}
 	})
 
-	// Every other path: apply current chaos settings, then answer.
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		s := chaos.get()
 
@@ -174,8 +161,7 @@ func main() {
 	}
 }
 
-// newLogger builds a slog.Logger writing to stdout in the requested
-// format ("json" or "text").
+
 func newLogger(format string) (*slog.Logger, error) {
 	switch format {
 	case "json":

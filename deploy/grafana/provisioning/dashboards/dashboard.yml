@@ -1,6 +1,4 @@
 # Tells Grafana to load any dashboard JSON files it finds in the mounted
-# /var/lib/grafana/dashboards directory (see docker-compose.yml) - no
-# manual "Import dashboard" step needed.
 apiVersion: 1
 
 providers:
