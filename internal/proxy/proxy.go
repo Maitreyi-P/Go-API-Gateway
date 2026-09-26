@@ -1,8 +1,4 @@
 // Package proxy implements the gateway's routing and reverse-proxy core:
-// matching requests to a configured route by longest path prefix,
-// enforcing that route's rate limit (if any), then forwarding to a
-// backend chosen by round-robin among those whose circuit breaker
-// currently allows calls.
 package proxy
 
 import (
@@ -27,48 +23,37 @@ import (
 	"github.com/Maitreyi-P/Go-API-Gateway/internal/ratelimit"
 )
 
-// Router matches incoming requests to a route and proxies them to a
-// backend. It implements http.Handler.
+
 type Router struct {
 	routes  []*compiledRoute
 	metrics *metrics.Metrics
 	logger  *slog.Logger
 }
 
-// backendTarget is one backend of a route: its URL, a ready-to-use reverse
-// proxy, and its own circuit breaker.
+
 type backendTarget struct {
 	url     *url.URL
 	proxy   *httputil.ReverseProxy
-	breaker *breaker.Breaker // nil means circuit breaking is disabled for this backend
+	breaker *breaker.Breaker 
 }
 
-// compiledRoute is a route with its backends pre-parsed into ready-to-use
-// targets, plus round-robin and rate-limit state.
+
 type compiledRoute struct {
 	prefix   string
 	backends []*backendTarget
 	next     atomic.Uint32
 
-	// limiter is nil when the route has no rate_limit configured, meaning
-	// requests to it are unlimited.
+
 	limiter *ratelimit.Limiter
 }
 
-// RouteInfo is a read-only summary of a compiled route, used for startup
-// logging.
+
 type RouteInfo struct {
 	PathPrefix string
 	Backends   []string
 }
 
-// NewRouter builds a Router from a validated config. It pre-parses every
-// backend URL and constructs one reverse proxy per backend up front, so
-// request handling does no allocation beyond round-robin selection.
-//
-// m may be nil, in which case the Router creates its own Metrics backed by
-// a private registry (useful for callers, such as most tests, that don't
-// care about inspecting metrics).
+
 func NewRouter(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (*Router, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -115,7 +100,6 @@ func NewRouter(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (*Ro
 		routes = append(routes, cr)
 	}
 
-	// Longest prefix first, so matching can stop at the first hit.
 	sort.Slice(routes, func(i, j int) bool {
 		return len(routes[i].prefix) > len(routes[j].prefix)
 	})
@@ -123,7 +107,7 @@ func NewRouter(cfg *config.Config, logger *slog.Logger, m *metrics.Metrics) (*Ro
 	return &Router{routes: routes, metrics: m, logger: logger}, nil
 }
 
-// Routes returns a summary of the compiled routes for startup logging.
+
 func (rt *Router) Routes() []RouteInfo {
 	out := make([]RouteInfo, 0, len(rt.routes))
 	for _, r := range rt.routes {
@@ -136,21 +120,6 @@ func (rt *Router) Routes() []RouteInfo {
 	return out
 }
 
-// ServeHTTP matches the request to a route by longest path_prefix,
-// enforces that route's rate limit (if configured), and forwards allowed
-// requests to the next available backend in the route's round-robin
-// rotation, skipping any backend whose circuit breaker is currently Open.
-//
-// If no route matches, it responds 404 with a JSON error body. If the
-// client has exceeded the route's rate limit, it responds 429 with a
-// Retry-After header and a JSON error body, without contacting any
-// backend. If every backend's breaker is Open, it responds 503 with a
-// JSON error body, again without contacting any backend.
-//
-// Every request that completes, regardless of outcome, is recorded in
-// gateway_requests_total and gateway_request_duration_seconds, and logged
-// at Info level with its method, path, matched route, backend, status,
-// and latency.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -175,8 +144,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt.finish(r, route.prefix, backendURL, status, start)
 }
 
-// finish records a completed request's metrics and Info-level log line
-// together, so every exit path in ServeHTTP reports both consistently.
+
 func (rt *Router) finish(r *http.Request, route, backendURL string, status int, start time.Time) {
 	duration := time.Since(start)
 	rt.metrics.ObserveRequest(route, backendURL, status, duration)
@@ -199,12 +167,7 @@ func (rt *Router) match(path string) *compiledRoute {
 	return nil
 }
 
-// allowRequest enforces the route's rate limit, if any. When the request
-// is not allowed, it records the rejection in
-// gateway_rate_limit_rejections_total, logs it at Warn level with the
-// client's identifier, writes the 429 response itself (including a
-// Retry-After header estimating when a token will next be available), and
-// returns false; the caller must not forward the request in that case.
+
 func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m *metrics.Metrics, logger *slog.Logger) bool {
 	if cr.limiter == nil {
 		return true
@@ -230,16 +193,7 @@ func (cr *compiledRoute) allowRequest(w http.ResponseWriter, r *http.Request, m 
 	return false
 }
 
-// forward picks the next backend in round-robin order, skipping any whose
-// circuit breaker is Open, and proxies the request to it. It reports the
-// outcome (backend unreachable, or a 5xx response, counts as failure) back
-// to that backend's breaker, records that backend's resulting state in
-// gateway_circuit_breaker_state, and logs at Warn level whenever the
-// breaker's state actually changes, before returning.
-//
-// It returns ok=false, having written nothing, if every backend is
-// currently unavailable (Open); the caller is responsible for responding
-// in that case.
+
 func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metrics.Metrics, logger *slog.Logger) (backendURL string, status int, ok bool) {
 	n := len(cr.backends)
 	start := int(cr.next.Add(1) % uint32(n))
@@ -270,9 +224,7 @@ func (cr *compiledRoute) forward(w http.ResponseWriter, r *http.Request, m *metr
 	return "", 0, false
 }
 
-// recordBreakerState updates the gateway_circuit_breaker_state gauge for
-// bt to its current state, and logs a Warn-level line if that state
-// differs from before (i.e. this call is what caused a transition).
+
 func recordBreakerState(m *metrics.Metrics, logger *slog.Logger, bt *backendTarget, before breaker.State) {
 	after := bt.breaker.State()
 	m.SetBreakerState(bt.url.String(), after)
@@ -285,9 +237,7 @@ func recordBreakerState(m *metrics.Metrics, logger *slog.Logger, bt *backendTarg
 	}
 }
 
-// statusRecorder wraps an http.ResponseWriter to capture the status code
-// ultimately written, so the caller can classify the response as a
-// success or failure for the circuit breaker after ServeHTTP returns.
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -309,18 +259,13 @@ func (rec *statusRecorder) Write(b []byte) (int, error) {
 	return rec.ResponseWriter.Write(b)
 }
 
-// Flush lets httputil.ReverseProxy stream responses (e.g. chunked bodies)
-// through the recorder as it would through the underlying writer directly.
+
 func (rec *statusRecorder) Flush() {
 	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-// newReverseProxy builds a ReverseProxy for a single backend target, with a
-// custom Director that rewrites the request to the backend's scheme/host
-// while preserving the original path and query, and a custom ErrorHandler
-// that returns a JSON 502 instead of the default plaintext proxy error.
 func newReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
 	director := func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
@@ -329,10 +274,7 @@ func newReverseProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProx
 	}
 
 	errorHandler := func(w http.ResponseWriter, r *http.Request, err error) {
-		// Warn, not Error: an unreachable backend is an expected failure
-		// mode the gateway is designed to handle (it reports 502 to the
-		// client and the failure counts toward that backend's circuit
-		// breaker) rather than a bug in the gateway itself.
+		
 		logger.Warn("backend unreachable",
 			"backend", target.String(),
 			"method", r.Method,

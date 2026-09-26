@@ -10,29 +10,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RateLimit configures per-route token-bucket rate limiting: up to Burst
-// requests may arrive at once, refilling at RequestsPerSecond thereafter.
+
 type RateLimit struct {
 	RequestsPerSecond float64 `yaml:"requests_per_second"`
 	Burst             int     `yaml:"burst"`
 }
 
-// CircuitBreaker configures per-backend circuit breaking: a backend trips
-// from Closed to Open once its failure rate within a rolling window of
-// WindowSeconds crosses FailureThreshold, then stays Open for
-// CooldownSeconds before a single trial call is allowed through.
+
 type CircuitBreaker struct {
 	FailureThreshold float64 `yaml:"failure_threshold"`
 	WindowSeconds    int     `yaml:"window_seconds"`
 	CooldownSeconds  int     `yaml:"cooldown_seconds"`
 }
 
-// Route defines a single routing rule: requests whose path starts with
-// PathPrefix are forwarded to one of Backends (round-robin if more than
-// one is configured). RateLimit and CircuitBreaker are both optional; a
-// route without one is unlimited / never trips, respectively. CircuitBreaker
-// applies independently to each backend in Backends, not to the route as a
-// whole.
+
 type Route struct {
 	PathPrefix     string          `yaml:"path_prefix"`
 	Backends       []string        `yaml:"backends"`
@@ -40,12 +31,12 @@ type Route struct {
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker,omitempty"`
 }
 
-// Config is the top-level gateway configuration.
+
 type Config struct {
 	Routes []Route `yaml:"routes"`
 }
 
-// Load reads the YAML config file at path, parses it, and validates it.
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -64,8 +55,7 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate checks that every route has a usable, unique path prefix and at
-// least one valid backend URL.
+
 func (c *Config) Validate() error {
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("no routes defined")
